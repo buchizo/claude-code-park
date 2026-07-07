@@ -38,8 +38,10 @@ pub async fn list_replay_sessions(state: State<'_, AppState>) -> AppResult<Vec<R
         let now = Utc::now();
         let now_sys = std::time::SystemTime::now();
         let mut out: Vec<ReplaySessionMeta> = Vec::new();
-        let pattern = format!("{}/*/*.jsonl", projects_dir.display());
-        for path in glob::glob(&pattern).into_iter().flatten().flatten() {
+        for path in crate::jsonl::walk::subdirs(&projects_dir)
+            .iter()
+            .flat_map(|proj| crate::jsonl::walk::jsonl_files_in(proj))
+        {
             let Some(Target::Main { session_id }) = route_path(&projects_dir, &path) else {
                 continue;
             };
@@ -83,16 +85,22 @@ pub async fn get_replay_data(state: State<'_, AppState>, session_id: String) -> 
         for_each_entry(&path, |e| main.push(e));
 
         let mut subs: Vec<crate::pipeline::replay::SubFile> = Vec::new();
-        let sub_pattern = format!(
-            "{}/*/{}/subagents/agent-*.jsonl",
-            projects_dir.display(),
-            session_id
-        );
-        for sub_path in glob::glob(&sub_pattern).into_iter().flatten().flatten() {
+        for sub_path in crate::jsonl::walk::subdirs(&projects_dir)
+            .iter()
+            .flat_map(|proj| {
+                crate::jsonl::walk::jsonl_files_in(&proj.join(&session_id).join("subagents"))
+            })
+            .filter(|p| {
+                // Same shape the old `agent-*.jsonl` glob enforced.
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("agent-"))
+            })
+        {
             let Some(Target::Sub { parent_id, agent_id }) = route_path(&projects_dir, &sub_path) else {
                 continue;
             };
-            // The glob pattern embeds session_id verbatim; route_path's own parse of the
+            // The probed layout embeds session_id verbatim; route_path's own parse of the
             // path is the source of truth for which session a match actually belongs to.
             if parent_id != session_id {
                 continue;

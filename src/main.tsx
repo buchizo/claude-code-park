@@ -26,6 +26,12 @@ function showFatal(label: string, detail: unknown) {
 window.addEventListener("error", (e) => showFatal("window.error", e.error ?? e.message));
 window.addEventListener("unhandledrejection", (e) => showFatal("unhandledrejection", e.reason));
 
+// Platform class for OS-specific CSS: macOS overlays the traffic-light buttons
+// over the content (titleBarStyle: Overlay), other platforms use a native title bar.
+document.documentElement.classList.add(
+  navigator.userAgent.includes("Mac") ? "plat-mac" : "plat-other",
+);
+
 // Note: we don't use StrictMode. In dev it runs effects twice, which causes Pixi's Application
 // to double-attach to the same canvas and break rendering (a common workaround for canvas-based apps).
 try {

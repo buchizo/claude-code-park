@@ -12,8 +12,19 @@ permissions:
 
 jobs:
   release:
-    # macOS-only app (depends on osascript / ps). Use a macOS runner to build a single universal binary.
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS: a single universal binary (.dmg) for Intel and Apple Silicon.
+          - platform: macos-latest
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            tauri-args: --target universal-apple-darwin
+          # Windows: x64 .msi / NSIS installer.
+          - platform: windows-latest
+            rust-targets: x86_64-pc-windows-msvc
+            tauri-args: ""
+    runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,8 +38,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Both arch targets for universal-apple-darwin.
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ matrix.rust-targets }}
 
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
@@ -42,13 +52,12 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # No Apple signing/notarization (free distribution). Tauri ad-hoc signs automatically.
-          # Signs the updater artifacts (.app.tar.gz) so installed apps can verify in-app updates.
+          # No OS code signing/notarization (free distribution). Tauri ad-hoc signs automatically on macOS.
+          # Signs the updater artifacts so installed apps can verify in-app updates.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          # Build a single .dmg for both Intel and Apple Silicon.
-          args: --target universal-apple-darwin
+          args: ${{ matrix.tauri-args }}
           tagName: ${{ github.ref_name }}
           releaseName: "Claude Code Park ${{ github.ref_name }}"
           releaseBody: |
@@ -63,7 +72,12 @@ jobs:
                  xattr -dr com.apple.quarantine "/Applications/Claude Code Park.app"
                  ```
 
-            ⚠️ This app reads and visualizes `~/.claude/`, so it assumes macOS with Claude Code installed.
+            ## Install (Windows)
+
+            1. Download the `.msi` (or the NSIS `-setup.exe`) from the Assets below and run it.
+            2. The app is unsigned, so SmartScreen may warn you: click "More info" → "Run anyway".
+
+            ⚠️ This app reads and visualizes `~/.claude/`, so it assumes Claude Code is installed.
           # The in-app updater reads /releases/latest/download/latest.json, and GitHub
           # excludes drafts from "latest" — updates reach users only after the draft is
           # manually published on GitHub. Publishing the draft IS the release switch.

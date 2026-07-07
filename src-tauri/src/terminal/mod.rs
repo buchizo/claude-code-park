@@ -1,12 +1,18 @@
 use serde::{Deserialize, Serialize};
 
-/// Kind of host terminal app. Classified from comm (the executable path).
+#[cfg(windows)]
+pub mod windows;
+
+/// Kind of host terminal app. Classified from comm (the executable path on
+/// macOS, the executable file name on Windows).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalKind {
     TerminalApp,
     ITerm2,
     VsCode,
     Ghostty,
+    /// Windows Terminal (WindowsTerminal.exe).
+    WindowsTerminal,
     Unknown,
 }
 
@@ -25,15 +31,25 @@ pub struct HostTerminal {
     pub kind: TerminalKind,
 }
 
-/// Determines the host terminal kind from comm (the executable's absolute path).
+/// Determines the host terminal kind from comm (the executable's absolute
+/// path on macOS, the executable file name on Windows).
 /// Case-insensitive substring match. Checks specific names first, then generic ones.
 pub fn classify_comm(comm: &str) -> TerminalKind {
     let c = comm.to_lowercase();
+    // Exe file name (last path segment), for the exact-name matches below.
+    let base = c.rsplit(['/', '\\']).find(|s| !s.is_empty()).unwrap_or(&c);
     if c.contains("ghostty") {
         TerminalKind::Ghostty
     } else if c.contains("iterm") {
         TerminalKind::ITerm2
-    } else if c.contains("visual studio code") || c.contains("code helper") || c.contains("/electron") {
+    } else if c.contains("windowsterminal") {
+        TerminalKind::WindowsTerminal
+    } else if c.contains("visual studio code")
+        || c.contains("code helper")
+        || c.contains("/electron")
+        || base == "code.exe"
+        || base == "code - insiders.exe"
+    {
         TerminalKind::VsCode
     } else if c.contains("terminal.app") {
         TerminalKind::TerminalApp
@@ -58,6 +74,9 @@ pub fn parse_session_entry(json: &str) -> Option<(u32, String)> {
 
 /// Parses `ps -axo pid=,ppid=,comm=` output.
 /// Each line: leading-space-padded pid, ppid, and space-separated comm (comm itself may contain spaces).
+/// macOS-only at runtime (Windows snapshots processes via Toolhelp32 instead);
+/// compiled for tests everywhere so the parser stays covered cross-platform.
+#[cfg(any(target_os = "macos", test))]
 pub fn parse_ps_rows(out: &str) -> Vec<ProcRow> {
     out.lines()
         .filter_map(|line| {
@@ -115,6 +134,21 @@ mod tests {
             TerminalKind::ITerm2
         );
         assert_eq!(classify_comm("/bin/zsh"), TerminalKind::Unknown);
+    }
+
+    #[test]
+    fn classify_windows_terminals() {
+        assert_eq!(classify_comm("WindowsTerminal.exe"), TerminalKind::WindowsTerminal);
+        assert_eq!(classify_comm("Code.exe"), TerminalKind::VsCode);
+        assert_eq!(classify_comm("Code - Insiders.exe"), TerminalKind::VsCode);
+        assert_eq!(
+            classify_comm(r"C:\Users\x\AppData\Local\Programs\Microsoft VS Code\Code.exe"),
+            TerminalKind::VsCode
+        );
+        // Shells and lookalike names are not terminals.
+        assert_eq!(classify_comm("pwsh.exe"), TerminalKind::Unknown);
+        assert_eq!(classify_comm("cmd.exe"), TerminalKind::Unknown);
+        assert_eq!(classify_comm("xcode.exe"), TerminalKind::Unknown);
     }
 
     #[test]

@@ -16,10 +16,7 @@
         "width": 1200,
         "height": 800,
         "minWidth": 900,
-        "minHeight": 600,
-        "titleBarStyle": "Overlay",
-        "hiddenTitle": true,
-        "trafficLightPosition": { "x": 20, "y": 25 }
+        "minHeight": 600
       }
     ],
     "security": {
@@ -29,7 +26,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/icon.png"],
+    "icon": ["icons/icon.png", "icons/icon.ico"],
     "createUpdaterArtifacts": true
   },
   "plugins": {

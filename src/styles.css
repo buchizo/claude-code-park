@@ -33,13 +33,18 @@ body,
 .tabbar {
   display: flex;
   gap: 4px;
-  /* 12px top/bottom gives roughly a Finder-toolbar height, leaving room for the traffic-light buttons.
-     96px on the left is padding for the width of the macOS traffic-light buttons (which float over the content with titleBarStyle: Overlay),
-     placing "Claude Code Park" a little to the right of the buttons with some spacing. */
-  padding: 12px 16px 12px 96px;
+  padding: 12px 16px;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
   align-items: center;
+}
+
+/* 12px top/bottom gives roughly a Finder-toolbar height, leaving room for the traffic-light buttons.
+   96px on the left is padding for the width of the macOS traffic-light buttons (which float over the
+   content with titleBarStyle: Overlay), placing "Claude Code Park" a little to the right of the buttons
+   with some spacing. Other platforms use a native title bar, so no extra inset is needed. */
+.plat-mac .tabbar {
+  padding-left: 96px;
 }
 
 .tabbar .brand {

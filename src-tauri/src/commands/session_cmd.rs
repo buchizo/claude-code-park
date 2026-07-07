@@ -33,19 +33,21 @@ pub async fn get_session_timeline(
     .map_err(|e| AppError::Other(format!("timeline fetch task failed: {e}")))?
 }
 
-/// Resolves the actual JSONL path from session_id (+ agent_id) via glob.
+/// Resolves the actual JSONL path from session_id (+ agent_id) by probing each
+/// project directory for the expected layout.
 /// Validates it against the expected path (Main / Sub) with route_path before returning.
 pub(crate) fn resolve_path(projects_dir: &std::path::Path, session_id: &str, agent_id: Option<&str>) -> Option<PathBuf> {
-    let pattern = match agent_id {
-        Some(aid) => format!(
-            "{}/*/{}/subagents/agent-{}.jsonl",
-            projects_dir.display(),
-            session_id,
-            aid
-        ),
-        None => format!("{}/*/{}.jsonl", projects_dir.display(), session_id),
-    };
-    for path in glob::glob(&pattern).into_iter().flatten().flatten() {
+    for proj in crate::jsonl::walk::subdirs(projects_dir) {
+        let path = match agent_id {
+            Some(aid) => proj
+                .join(session_id)
+                .join("subagents")
+                .join(format!("agent-{aid}.jsonl")),
+            None => proj.join(format!("{session_id}.jsonl")),
+        };
+        if !path.is_file() {
+            continue;
+        }
         match (agent_id, route_path(projects_dir, &path)) {
             (None, Some(Target::Main { session_id: sid })) if sid == session_id => return Some(path),
             (Some(aid), Some(Target::Sub { parent_id, agent_id: routed_aid }))

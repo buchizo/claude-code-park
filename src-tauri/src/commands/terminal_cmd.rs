@@ -1,29 +1,33 @@
 use crate::error::{AppError, AppResult};
 use crate::model::terminal::FocusResult;
 use crate::state::AppState;
-use crate::terminal::{
-    find_host_terminal, parse_ps_rows, parse_session_entry, TerminalKind,
-};
+use crate::terminal::{find_host_terminal, parse_session_entry, TerminalKind};
+#[cfg(target_os = "macos")]
+use crate::terminal::parse_ps_rows;
 use std::path::PathBuf;
+#[cfg(any(target_os = "macos", windows))]
 use std::process::Command;
 use tauri::State;
 
-/// Terminal kind -> app name used for `activate` / `open -a`.
+/// Terminal kind -> display name (also the target of macOS `activate`).
 pub fn app_name(kind: &TerminalKind) -> Option<&'static str> {
     match kind {
         TerminalKind::Ghostty => Some("Ghostty"),
         TerminalKind::ITerm2 => Some("iTerm"),
         TerminalKind::VsCode => Some("Visual Studio Code"),
         TerminalKind::TerminalApp => Some("Terminal"),
+        TerminalKind::WindowsTerminal => Some("Windows Terminal"),
         TerminalKind::Unknown => None,
     }
 }
 
 /// The essential script that just brings the app to the front. If this fails, it's a real failure.
+#[cfg(any(target_os = "macos", test))]
 pub fn build_activate_script(app: &str) -> String {
     format!("tell application \"{app}\" to activate")
 }
 
+#[cfg(any(target_os = "macos", test))]
 /// Best-effort script that identifies an existing terminal window and brings it to the front.
 /// - Terminal.app / iTerm2: strictly selects the window/tab with a matching tty via AppleScript.
 /// - VSCode/Ghostty: AXRaises the window whose title contains the needle via System Events.
@@ -86,10 +90,13 @@ pub fn build_window_focus_script(kind: &TerminalKind, tty: Option<&str>, title_n
                  end tell"
             )
         }
-        TerminalKind::Unknown => String::new(),
+        // Windows Terminal never reaches the AppleScript path (Windows focuses
+        // via Win32 in focus_impl); no window-identification script exists for it.
+        TerminalKind::WindowsTerminal | TerminalKind::Unknown => String::new(),
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 /// Extracts the outermost `.app` bundle root from a VSCode host process path.
 /// e.g. ".../Visual Studio Code.app/Contents/Frameworks/Code Helper.app/..." -> ".../Visual Studio Code.app".
 /// Returns None when the path contains no `.app` segment.
@@ -98,6 +105,7 @@ pub fn vscode_bundle_root(comm: &str) -> Option<&str> {
     Some(&comm[..idx + ".app".len()])
 }
 
+#[cfg(any(target_os = "macos", test))]
 /// Candidate paths for the bundled VSCode CLI, given a `.app` bundle root.
 /// Stable ships `code`, Insiders ships `code-insiders`; we try stable first.
 pub fn vscode_cli_candidates(bundle_root: &str) -> Vec<String> {
@@ -108,6 +116,7 @@ pub fn vscode_cli_candidates(bundle_root: &str) -> Vec<String> {
 }
 
 /// Resolves the bundled VSCode CLI binary from the host process path, if it exists on disk.
+#[cfg(target_os = "macos")]
 fn resolve_vscode_cli(host_comm: &str) -> Option<std::path::PathBuf> {
     let root = vscode_bundle_root(host_comm)?;
     vscode_cli_candidates(root)
@@ -116,6 +125,7 @@ fn resolve_vscode_cli(host_comm: &str) -> Option<std::path::PathBuf> {
         .find(|p| p.exists())
 }
 
+#[cfg(any(target_os = "macos", test))]
 /// Whether window identification can be considered "reliable" (= whether window_focused can be true).
 /// Terminal.app / iTerm2 are reliable because they can strictly select a window by matching tty.
 /// VSCode/Ghostty rely on best-effort title matching, so even on success they aren't treated as reliable.
@@ -146,9 +156,21 @@ pub async fn focus_terminal_core(
     session_id: String,
     project: String,
 ) -> AppResult<FocusResult> {
-    tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || focus_impl(&sessions_dir, &session_id, &project))
+        .await
+        .map_err(|e| AppError::Other(format!("terminal focus task failed: {e}")))?
+}
+
+/// macOS focus flow: `ps` for the process tree, AppleScript for activation.
+#[cfg(target_os = "macos")]
+fn focus_impl(
+    sessions_dir: &std::path::Path,
+    session_id: &str,
+    project: &str,
+) -> AppResult<FocusResult> {
+    {
         // 1. session_id -> running claude PID, via the session file Claude Code writes.
-        let claude_pid = resolve_claude_pid(&sessions_dir, &session_id).ok_or_else(|| {
+        let claude_pid = resolve_claude_pid(sessions_dir, session_id).ok_or_else(|| {
             AppError::Other("no running claude process found (the session may have ended)".into())
         })?;
 
@@ -176,7 +198,7 @@ pub async fn focus_terminal_core(
         if host.kind == TerminalKind::VsCode {
             let host_comm = rows.iter().find(|r| r.pid == host.pid).map(|r| r.comm.as_str());
             if let Some(code_bin) = host_comm.and_then(resolve_vscode_cli) {
-                let st = Command::new(&code_bin).arg("-r").arg(&project).status();
+                let st = Command::new(&code_bin).arg("-r").arg(project).status();
                 if matches!(st, Ok(s) if s.success()) {
                     return Ok(FocusResult {
                         app: app.to_string(),
@@ -198,7 +220,7 @@ pub async fn focus_terminal_core(
         }
 
         // 2. Window identification (best-effort). Ignore failures like missing permission (activate done = success).
-        let needle = crate::pipeline::classify::basename(&project);
+        let needle = crate::pipeline::classify::basename(project);
         let focus_script = build_window_focus_script(&host.kind, tty, needle);
         let window_focused = if focus_script.is_empty() {
             false
@@ -217,12 +239,131 @@ pub async fn focus_terminal_core(
             app: app.to_string(),
             window_focused,
         })
-    })
-    .await
-    .map_err(|e| AppError::Other(format!("terminal focus task failed: {e}")))?
+    }
+}
+
+/// Windows focus flow: Toolhelp32 for the process tree, Win32 window focusing.
+/// VS Code still goes through its CLI (`bin\code.cmd -r <folder>`) for exact
+/// window targeting; other terminals get their top-level window raised via
+/// SetForegroundWindow. Tab-level targeting (which tab inside Windows
+/// Terminal) has no public API, so window_focused stays best-effort false.
+#[cfg(windows)]
+fn focus_impl(
+    sessions_dir: &std::path::Path,
+    session_id: &str,
+    project: &str,
+) -> AppResult<FocusResult> {
+    use crate::terminal::windows as win;
+
+    // 1. session_id -> running claude PID, via the session file Claude Code writes.
+    let claude_pid = resolve_claude_pid(sessions_dir, session_id).ok_or_else(|| {
+        AppError::Other("no running claude process found (the session may have ended)".into())
+    })?;
+
+    // 2. Snapshot all processes and walk ppid to determine the host terminal.
+    let rows = win::list_processes()?;
+    let host = find_host_terminal(claude_pid, &rows)
+        .ok_or_else(|| AppError::Other("could not identify the host terminal".into()))?;
+    let app = app_name(&host.kind)
+        .ok_or_else(|| AppError::Other("unsupported terminal".into()))?;
+
+    // VS Code: focus the exact window via the CLI shim next to Code.exe
+    // (`bin\code.cmd -r <folder>`), same one-window-per-workspace rationale as
+    // macOS. On failure, fall through to raising a Code.exe window directly.
+    if host.kind == TerminalKind::VsCode {
+        if let Some(cli) = win::full_process_path(host.pid)
+            .as_deref()
+            .and_then(resolve_vscode_cli_win)
+        {
+            let st = hidden_command(&cli).arg("-r").arg(project).status();
+            if matches!(st, Ok(s) if s.success()) {
+                return Ok(FocusResult {
+                    app: app.to_string(),
+                    window_focused: true,
+                });
+            }
+            eprintln!("focus_terminal: code CLI focus failed, falling back to window focus");
+        }
+    }
+
+    // The matched process may be a windowless helper (VS Code's pty host), so
+    // try each same-kind ancestor from the nearest up until one owns a window.
+    let mut last_err = AppError::Other(format!("could not bring {app} to the front"));
+    for pid in same_kind_ancestors(claude_pid, &host.kind, &rows) {
+        match win::focus_window_of_pid(pid) {
+            Ok(()) => {
+                return Ok(FocusResult {
+                    app: app.to_string(),
+                    // Raising the window is not tab-accurate, so never claim reliability.
+                    window_focused: false,
+                });
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    eprintln!("focus_terminal: failed to focus app={app}: {last_err}");
+    Err(last_err)
+}
+
+/// Pids along the ppid chain from `start_pid` whose comm classifies as `kind`,
+/// nearest first. Windows helper processes (e.g. VS Code's pty host) share the
+/// terminal's executable but own no window, so the caller tries each in turn.
+#[cfg(any(windows, test))]
+pub fn same_kind_ancestors(
+    start_pid: u32,
+    kind: &TerminalKind,
+    rows: &[crate::terminal::ProcRow],
+) -> Vec<u32> {
+    let by_pid = |pid: u32| rows.iter().find(|r| r.pid == pid);
+    let mut out = Vec::new();
+    let mut cur = start_pid;
+    for _ in 0..64 {
+        let Some(row) = by_pid(cur) else { break };
+        if crate::terminal::classify_comm(&row.comm) == *kind {
+            out.push(row.pid);
+        }
+        if row.ppid <= 1 {
+            break;
+        }
+        cur = row.ppid;
+    }
+    out
+}
+
+/// CLI shim candidates that ship next to a VS Code executable on Windows:
+/// `<dir>\bin\code.cmd` (stable) and `<dir>\bin\code-insiders.cmd`.
+#[cfg(any(windows, test))]
+pub fn vscode_cli_candidates_win(exe_path: &str) -> Vec<PathBuf> {
+    let Some(dir) = std::path::Path::new(exe_path).parent() else {
+        return Vec::new();
+    };
+    ["code.cmd", "code-insiders.cmd"]
+        .iter()
+        .map(|bin| dir.join("bin").join(bin))
+        .collect()
+}
+
+/// Resolves the VS Code CLI shim from the running Code.exe path, if it exists on disk.
+#[cfg(windows)]
+fn resolve_vscode_cli_win(exe_path: &str) -> Option<PathBuf> {
+    vscode_cli_candidates_win(exe_path)
+        .into_iter()
+        .find(|p| p.exists())
+}
+
+/// A Command that won't flash a console window (CREATE_NO_WINDOW); required
+/// when spawning `.cmd` shims from a GUI app.
+#[cfg(windows)]
+fn hidden_command(program: &std::path::Path) -> Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut cmd = Command::new(program);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
 }
 
 /// Runs a command and returns stdout as a string. The caller decides on the exit code.
+#[cfg(target_os = "macos")]
 fn run_capture(cmd: &str, args: &[&str]) -> AppResult<String> {
     let out = Command::new(cmd)
         .args(args)
@@ -234,8 +375,12 @@ fn run_capture(cmd: &str, args: &[&str]) -> AppResult<String> {
 /// Scans `~/.claude/sessions/*.json` and returns the claude PID of the file with a matching sessionId.
 /// Since Claude Code writes one per running session, session_id -> PID can be resolved without a hook.
 fn resolve_claude_pid(sessions_dir: &std::path::Path, session_id: &str) -> Option<u32> {
-    let pattern = format!("{}/*.json", sessions_dir.display());
-    for path in glob::glob(&pattern).into_iter().flatten().flatten() {
+    let entries = std::fs::read_dir(sessions_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
         let Ok(content) = std::fs::read_to_string(&path) else { continue };
         let Some((pid, sid)) = parse_session_entry(&content) else { continue };
         if sid == session_id {
@@ -255,7 +400,46 @@ mod tests {
         assert_eq!(app_name(&TerminalKind::ITerm2), Some("iTerm"));
         assert_eq!(app_name(&TerminalKind::VsCode), Some("Visual Studio Code"));
         assert_eq!(app_name(&TerminalKind::TerminalApp), Some("Terminal"));
+        assert_eq!(app_name(&TerminalKind::WindowsTerminal), Some("Windows Terminal"));
         assert_eq!(app_name(&TerminalKind::Unknown), None);
+    }
+
+    #[test]
+    fn same_kind_ancestors_orders_nearest_first() {
+        use crate::terminal::ProcRow;
+        // node <- pwsh <- Code.exe (pty host) <- Code.exe (main window)
+        let rows = vec![
+            ProcRow { pid: 40, ppid: 30, comm: "node.exe".into() },
+            ProcRow { pid: 30, ppid: 20, comm: "pwsh.exe".into() },
+            ProcRow { pid: 20, ppid: 10, comm: "Code.exe".into() },
+            ProcRow { pid: 10, ppid: 1, comm: "Code.exe".into() },
+        ];
+        assert_eq!(same_kind_ancestors(40, &TerminalKind::VsCode, &rows), vec![20, 10]);
+        assert!(same_kind_ancestors(40, &TerminalKind::WindowsTerminal, &rows).is_empty());
+    }
+
+    #[test]
+    fn vscode_cli_candidates_win_builds_bin_paths() {
+        let cands = vscode_cli_candidates_win(r"C:\Users\x\AppData\Local\Programs\Microsoft VS Code\Code.exe");
+        let strs: Vec<String> = cands.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        assert!(strs[0].ends_with("code.cmd"));
+        assert!(strs[1].ends_with("code-insiders.cmd"));
+        assert!(strs[0].contains("bin"));
+    }
+
+    #[test]
+    fn resolve_claude_pid_matches_session_file() {
+        let dir = std::env::temp_dir().join("ccpark-test-sessions");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("123.json"),
+            r#"{"pid":123,"sessionId":"abc","cwd":"x","status":"busy"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("ignore.txt"), "not json").unwrap();
+        assert_eq!(resolve_claude_pid(&dir, "abc"), Some(123));
+        assert_eq!(resolve_claude_pid(&dir, "zzz"), None);
     }
 
     #[test]

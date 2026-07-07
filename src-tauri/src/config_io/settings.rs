@@ -291,7 +291,8 @@ mod tests {
             plugins_dir.join("installed_plugins.json"),
             format!(
                 r#"{{"version":2,"plugins":{{"superpowers@official":[{{"scope":"user","installPath":"{}","version":"1"}}]}}}}"#,
-                plug_install.display()
+                // Forward slashes keep the embedded path valid JSON on Windows.
+                plug_install.display().to_string().replace('\\', "/")
             ),
         )
         .unwrap();
@@ -330,7 +331,8 @@ mod tests {
             plugins_dir.join("installed_plugins.json"),
             format!(
                 r#"{{"version":2,"plugins":{{"x@m":[{{"scope":"project","projectPath":"/other","installPath":"{}","version":"1"}}]}}}}"#,
-                plug_install.display()
+                // Forward slashes keep the embedded path valid JSON on Windows.
+                plug_install.display().to_string().replace('\\', "/")
             ),
         )
         .unwrap();

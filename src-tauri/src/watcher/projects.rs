@@ -94,10 +94,9 @@ fn run(
 
 /// Startup scan. Walks the jsonl files under projects and restores state for recent ones.
 fn initial_scan(app: &AppHandle, projects_dir: &Path, tail: &mut TailReader) {
-    let pattern = format!("{}/**/*.jsonl", projects_dir.display());
     let now = std::time::SystemTime::now();
     let mut restored = 0usize;
-    for entry in glob::glob(&pattern).into_iter().flatten().flatten() {
+    for entry in crate::jsonl::walk::jsonl_files_recursive(projects_dir) {
         let recent = std::fs::metadata(&entry)
             .and_then(|m| m.modified())
             .ok()
