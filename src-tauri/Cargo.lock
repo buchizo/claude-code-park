@@ -344,7 +344,6 @@ version = "0.7.0"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
- "glob",
  "notify",
  "notify-debouncer-full",
  "serde",
@@ -356,6 +355,7 @@ dependencies = [
  "tauri-plugin-updater",
  "thiserror 2.0.18",
  "ts-rs",
+ "windows",
 ]
 
 [[package]]

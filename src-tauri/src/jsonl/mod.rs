@@ -2,6 +2,7 @@ pub mod entry;
 pub mod meta;
 pub mod parse;
 pub mod tail;
+pub mod walk;
 
 pub use tail::TailReader;
 

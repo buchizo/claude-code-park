@@ -18,7 +18,7 @@ A concrete case: keeping Claude aligned with your team's conventions is hard wit
 - **Visualize Skills & Agents** — see which agents and skills are defined, and which ones are currently "at work."
 - **Manage multiple sessions on one screen** — run several Claude Code sessions at once and track all of their progress from a single view.
   ![Multi session](media/multi-session.gif)
-- **Jump back to the terminal in one click** — click an employee/session to bring the terminal that launched it (Terminal.app / iTerm2 / VS Code / Ghostty) to the front.
+- **Jump back to the terminal in one click** — click an employee/session to bring the terminal that launched it (Terminal.app / iTerm2 / VS Code / Ghostty on macOS, Windows Terminal / VS Code on Windows) to the front.
   ![Terminal focus](media/terminal-focus.gif)
 - **Management dashboard** — utilization, call count, failure rate, and tokens per agent, aggregated over today / 7d / 30d.
   ![Metrics](media/metrics.png)
@@ -33,10 +33,12 @@ A concrete case: keeping Claude aligned with your team's conventions is hard wit
 
 ## Requirements
 
-- **macOS only** (terminal focusing uses AppleScript / `ps`)
+- **macOS** (terminal focusing uses AppleScript / `ps`) or **Windows** (Win32; supports Windows Terminal and VS Code)
 - [Claude Code](https://docs.claude.com/claude-code) installed, with an existing `~/.claude/`
 
 ## Install (for users)
+
+### macOS
 
 1. Download the latest `.dmg` from [Releases](../../releases), open it, and drag Claude Code Park into Applications.
 2. The app is unsigned, so on first launch macOS Gatekeeper will warn you. Open it one of these ways:
@@ -46,6 +48,11 @@ A concrete case: keeping Claude aligned with your team's conventions is hard wit
      ```bash
      xattr -dr com.apple.quarantine "/Applications/Claude Code Park.app"
      ```
+
+### Windows
+
+1. Download the latest `.msi` (or the NSIS `-setup.exe`) from [Releases](../../releases) and run it.
+2. The app is unsigned, so SmartScreen may warn you: click "More info" → "Run anyway".
 
 ## Build from source / Development
 
@@ -62,7 +69,7 @@ Other commands:
 
 ```bash
 npm run build                                   # type-check + build the frontend
-npm run tauri build                             # produce a distributable .dmg
+npm run tauri build                             # produce a distributable (.dmg on macOS, .msi/.exe on Windows)
 cargo test --manifest-path src-tauri/Cargo.toml # Rust tests + regenerate ts-rs bindings
 ```
 

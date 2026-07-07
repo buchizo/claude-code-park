@@ -281,10 +281,52 @@ fn load_frames() -> tauri::Result<Vec<Image<'static>>> {
         .map(|bytes| {
             let decoded = Image::from_bytes(bytes)?;
             let (width, height) = (decoded.width(), decoded.height());
-            let rgba: &'static [u8] = Box::leak(decoded.rgba().to_vec().into_boxed_slice());
+            #[allow(unused_mut)]
+            let mut pixels = decoded.rgba().to_vec();
+            #[cfg(windows)]
+            recolor_for_windows_tray(&mut pixels);
+            let rgba: &'static [u8] = Box::leak(pixels.into_boxed_slice());
             Ok(Image::new(rgba, width, height))
         })
         .collect()
+}
+
+/// The bundled frames are macOS template images (black + alpha); Windows
+/// renders them as-is, so on a dark taskbar the mascot would be invisible.
+/// Repaint it white when the system theme is dark, keeping the alpha mask.
+#[cfg(windows)]
+fn recolor_for_windows_tray(rgba: &mut [u8]) {
+    if system_uses_light_theme() {
+        return;
+    }
+    for px in rgba.chunks_exact_mut(4) {
+        px[0] = 255;
+        px[1] = 255;
+        px[2] = 255;
+    }
+}
+
+/// Whether the Windows taskbar/system-tray area uses the light theme.
+/// Defaults to dark (the Windows default) when the registry value is missing.
+#[cfg(windows)]
+fn system_uses_light_theme() -> bool {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let mut data: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+            w!("SystemUsesLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut data as *mut u32 as *mut std::ffi::c_void),
+            Some(&mut size),
+        )
+        .is_ok()
+            && data != 0
+    }
 }
 
 #[cfg(test)]

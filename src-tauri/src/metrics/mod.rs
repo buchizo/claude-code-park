@@ -84,9 +84,8 @@ pub fn compute_all(
 
     // 1. Collect files updated within 30d and parse them.
     let mut parsed: BTreeMap<PathBuf, Vec<EntryStat>> = BTreeMap::new();
-    let pattern = format!("{}/**/*.jsonl", projects_dir.display());
     let now_sys = std::time::SystemTime::now();
-    for path in glob::glob(&pattern).into_iter().flatten().flatten() {
+    for path in crate::jsonl::walk::jsonl_files_recursive(projects_dir) {
         let recent = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok()
