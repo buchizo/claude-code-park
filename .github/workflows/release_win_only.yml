@@ -1,0 +1,54 @@
+name: Release
+
+# Pushing a tag that starts with `v` (e.g. v0.1.0) builds the app and creates a Release.
+on:
+  push:
+    tags:
+      - "v*"
+
+# Needed for tauri-action to create/update the Release.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Claude Code Park ${{ github.ref_name }}"
+          releaseBody: |
+            ## Install (Windows)
+
+            1. Download the `.msi` (or the NSIS `-setup.exe`) from the Assets below and run it.
+            2. The app is unsigned, so SmartScreen may warn you: click "More info" → "Run anyway".
+
+            ⚠️ This app reads and visualizes `~/.claude/`, so it assumes Claude Code is installed.
+          releaseDraft: true
+          prerelease: false
