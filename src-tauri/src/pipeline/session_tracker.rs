@@ -14,6 +14,12 @@ use chrono::{DateTime, Utc};
 const ACTIVE_SECS: i64 = 5 * 60;
 const IDLE_SECS: i64 = 15 * 60;
 
+/// Leading text of the tool_result returned immediately when an agent is spawned
+/// with run_in_background: the agent is still working, so this must not be taken
+/// as its completion. If a future CLI changes the wording, the fallback is a brief
+/// wrong Ended that the next transcript append revives, so detection degrades soft.
+const ASYNC_LAUNCH_ACK: &str = "Async agent launched successfully";
+
 /// Applies the diff entries of the main session JSONL to the World. Returns true if anything changed.
 /// Pushes the reconstructed lifecycle events onto `out`.
 pub fn apply_main(
@@ -29,12 +35,9 @@ pub fn apply_main(
     if is_new {
         out.push(crate::hook_events::HookEvent {
             session_id: session_id.to_string(),
-            agent_id: None,
             event: "SessionStart".to_string(),
-            tool_name: None,
             ts: entries[0].timestamp.clone().unwrap_or_default(),
-            correlation_id: None,
-            is_error: None,
+            ..Default::default()
         });
     }
     let session = world
@@ -47,6 +50,9 @@ pub fn apply_main(
         // Agent tool_use -> record each spawned sub agent clocking in. One assistant
         // entry may spawn several agents in parallel, so scan every block.
         register_agent_calls(session, e, None);
+        // The spawning tool_use's tool_result / a task-notification marks the
+        // matching run as completed the moment the CLI records it.
+        finalize_completed_runs(session, e);
         let last_tool = session.current.tool_name.clone();
         let skill = next_active_skill(e, session.current.active_skill.clone());
         let todos = next_todos(e, session.current.todos.clone());
@@ -91,11 +97,15 @@ pub fn apply_sub(
     for e in entries {
         if let Some(ts) = e.timestamp.clone() {
             session.subagents[idx].started_at.get_or_insert(ts.clone());
+            session.subagents[idx].last_event_at = Some(ts.clone());
             session.last_event_at = Some(ts);
         }
         // A subagent can itself spawn agents (nested delegation); record those
         // calls with this agent as the parent.
         register_agent_calls(session, e, Some(agent_id));
+        // This transcript also carries the tool_results / notifications that end
+        // the agents this subagent spawned.
+        finalize_completed_runs(session, e);
         // Record the model the assistant entry actually used (to pick the sprite by the
         // runtime model rather than the static model in the definition). Set it as soon as it is known, then update with later values.
         if let Some(model) = e.model() {
@@ -116,13 +126,31 @@ pub fn apply_sub(
             out.push(ev);
         }
     }
-    session.subagents[idx].status = SessionStatus::Active;
+    // Completed runs come back to life only on genuinely later activity (a resumed
+    // background agent). Trailing writes stamped before the parent's tool_result —
+    // the transcript and the parent append near-simultaneously, so the watcher may
+    // process them in either order — must not revive a finished run.
+    let run = &mut session.subagents[idx];
+    let revived = match (run.completed_at.as_deref(), run.last_event_at.as_deref()) {
+        (Some(completed), Some(last)) => ts_after(last, completed),
+        (Some(_), None) => false,
+        (None, _) => true,
+    };
+    if revived {
+        run.completed_at = None;
+        run.status = SessionStatus::Active;
+    }
     true
 }
 
 /// The lifecycle event reconstructed from a single entry.
 /// For PostToolUse, the caller passes the most recent tool name as `post_tool`
 /// (handled the same for main/sub). If is_sub=true, turn_end becomes SubagentStop.
+///
+/// Most firings are reconstructed facts (a tool_use proves PreToolUse fired) and
+/// carry no outcome. Entries that record a real hook execution — stop_hook_summary,
+/// hook_blocking_error / hook_cancelled attachments, and a PreToolUse rejection
+/// written into a tool_result — additionally carry outcome / duration / command.
 pub(crate) fn reconstruct(
     e: &RawEntry,
     session_id: &str,
@@ -130,32 +158,80 @@ pub(crate) fn reconstruct(
     post_tool: Option<String>,
     is_sub: bool,
 ) -> Option<crate::hook_events::HookEvent> {
-    let ts = e.timestamp.clone().unwrap_or_default();
-    let (event, tool_name, correlation_id, is_error): (
-        &str,
-        Option<String>,
-        Option<String>,
-        Option<bool>,
-    ) = if e.is_user_prompt() && !is_sub {
-        ("UserPromptSubmit", None, None, None)
-    } else if let Some(tb) = e.last_tool_use() {
-        ("PreToolUse", tb.name.clone(), tb.id.clone(), None)
-    } else if let Some(tr) = e.tool_results().next() {
-        ("PostToolUse", post_tool, tr.tool_use_id.clone(), tr.is_error)
-    } else if e.is_turn_end() {
-        (if is_sub { "SubagentStop" } else { "Stop" }, None, None, None)
-    } else {
-        return None;
-    };
-    Some(crate::hook_events::HookEvent {
+    use crate::hook_events::{HookEvent, HookOutcome};
+    /// Stop lifecycle names swap for the subagent variant inside a sub transcript.
+    fn stop_event(event: &str, is_sub: bool) -> String {
+        if is_sub && event == "Stop" {
+            "SubagentStop".to_string()
+        } else {
+            event.to_string()
+        }
+    }
+    let mut ev = HookEvent {
         session_id: session_id.to_string(),
         agent_id: agent_id.map(str::to_string),
-        event: event.to_string(),
-        tool_name,
-        ts,
-        correlation_id,
-        is_error,
-    })
+        ts: e.timestamp.clone().unwrap_or_default(),
+        ..Default::default()
+    };
+    if e.is_user_prompt() && !is_sub {
+        ev.event = "UserPromptSubmit".to_string();
+    } else if let Some(tb) = e.last_tool_use() {
+        ev.event = "PreToolUse".to_string();
+        ev.tool_name = tb.name.clone();
+        ev.correlation_id = tb.id.clone();
+    } else if let Some((tr, block)) = e
+        .tool_results()
+        .find_map(|tr| tr.pre_hook_block().map(|b| (tr, b)))
+    {
+        // A PreToolUse hook rejected the tool: it never ran, so this is the Pre
+        // firing's blocked outcome rather than a PostToolUse. Scanned across all
+        // tool_result blocks — a parallel batch may bury the rejection behind an
+        // ordinary result.
+        ev.event = "PreToolUse".to_string();
+        ev.tool_name = Some(block.tool);
+        ev.correlation_id = tr.tool_use_id.clone();
+        ev.outcome = Some(HookOutcome::Blocked);
+        ev.hook_command = block.command;
+        ev.block_reason = block.reason;
+    } else if let Some(tr) = e.tool_results().next() {
+        ev.event = "PostToolUse".to_string();
+        ev.tool_name = post_tool;
+        ev.correlation_id = tr.tool_use_id.clone();
+        ev.is_error = tr.is_error;
+    } else if let Some(b) = e.hook_blocking() {
+        // Deliberately in addition to the bare PostToolUse from the tool_result
+        // twin entry: the tool ran (its result resolves the Pre pairing) and the
+        // hook then blocked — two facts, two events, paired by correlation_id.
+        ev.event = stop_event(&b.event, is_sub);
+        ev.tool_name = b.tool;
+        ev.correlation_id = b.tool_use_id;
+        ev.outcome = Some(HookOutcome::Blocked);
+        ev.hook_command = b.command;
+        ev.block_reason = b.reason;
+    } else if let Some(c) = e.hook_cancelled() {
+        ev.event = stop_event(&c.event, is_sub);
+        ev.outcome = Some(HookOutcome::Cancelled);
+        ev.duration_ms = c.duration_ms;
+        ev.hook_command = c.command;
+    } else if let Some(s) = e.hook_summary() {
+        // Before is_turn_end: a blocked summary (preventedContinuation) is not a
+        // turn end, but the Stop lifecycle did fire and must still be reported.
+        ev.event = (if is_sub { "SubagentStop" } else { "Stop" }).to_string();
+        ev.outcome = Some(if s.blocked {
+            HookOutcome::Blocked
+        } else {
+            HookOutcome::Completed
+        });
+        ev.duration_ms = (s.duration_ms > 0.0).then_some(s.duration_ms);
+        ev.hook_command = (!s.commands.is_empty()).then(|| s.commands.join("\n"));
+        ev.block_reason = s.stop_reason;
+        ev.is_error = s.had_errors.then_some(true);
+    } else if e.is_turn_end() {
+        ev.event = (if is_sub { "SubagentStop" } else { "Stop" }).to_string();
+    } else {
+        return None;
+    }
+    Some(ev)
 }
 
 /// Creates an active main session.
@@ -273,6 +349,69 @@ fn absorb_meta(session: &mut Session, e: &RawEntry) {
     }
 }
 
+/// Marks runs whose completion this entry records: a tool_result answering the
+/// spawning Agent tool_use (except the run_in_background launch ack, which arrives
+/// while the agent works), or a task-notification saying a background agent stopped.
+/// Completion pins the run to Ended until the transcript proves later activity.
+fn finalize_completed_runs(session: &mut Session, e: &RawEntry) {
+    let Some(result_ts) = e.timestamp.as_deref() else {
+        // Without a timestamp the revival comparison cannot work; leave the run
+        // to the time-decay fallback.
+        return;
+    };
+    for tr in e.tool_results() {
+        if tr.result_text().is_some_and(|t| t.starts_with(ASYNC_LAUNCH_ACK)) {
+            continue;
+        }
+        let Some(tid) = tr.tool_use_id.as_deref() else {
+            continue;
+        };
+        if let Some(run) = session
+            .subagents
+            .iter_mut()
+            .find(|r| r.tool_use_id.as_deref() == Some(tid))
+        {
+            finalize_run(run, result_ts);
+        }
+    }
+    if let Some(n) = e.task_notification() {
+        if let Some(run) = session.subagents.iter_mut().find(|r| {
+            (!r.agent_id.is_empty() && r.agent_id == n.task_id)
+                || (r.tool_use_id.is_some() && r.tool_use_id == n.tool_use_id)
+        }) {
+            finalize_run(run, result_ts);
+        }
+    }
+}
+
+fn finalize_run(run: &mut SubAgentRun, result_ts: &str) {
+    // The transcript already shows activity past this completion record (a
+    // background agent that was resumed before we read the notification).
+    if run
+        .last_event_at
+        .as_deref()
+        .is_some_and(|last| ts_after(last, result_ts))
+    {
+        return;
+    }
+    run.completed_at = Some(result_ts.to_string());
+    run.status = SessionStatus::Ended;
+    mark_idle(&mut run.current);
+}
+
+/// Whether timestamp `a` is strictly later than `b`. Falls back to string order
+/// when either does not parse (Claude Code stamps are uniform RFC3339 UTC, so
+/// lexicographic order matches chronological order).
+fn ts_after(a: &str, b: &str) -> bool {
+    match (
+        DateTime::parse_from_rfc3339(a),
+        DateTime::parse_from_rfc3339(b),
+    ) {
+        (Ok(pa), Ok(pb)) => pa > pb,
+        _ => a > b,
+    }
+}
+
 /// Registers a SubAgentRun for every Agent tool_use in the entry.
 /// `caller` is the spawning subagent's id (None when the main session spawns).
 fn register_agent_calls(session: &mut Session, e: &RawEntry, caller: Option<&str>) {
@@ -335,6 +474,8 @@ fn register_subagent(
         description,
         model: None,
         started_at: ts.map(str::to_string),
+        last_event_at: None,
+        completed_at: None,
         status: SessionStatus::Active,
         current: ActivityState::default(),
         tool_use_id: tb.id.clone(),
@@ -446,9 +587,23 @@ pub fn recompute_statuses(world: &mut World, now: DateTime<Utc>) {
         if s.status != SessionStatus::Active && !keeps_awaiting_state(s.status, s.current.kind) {
             mark_idle(&mut s.current);
         }
+        // A killed CLI never records its subagents' tool_results, so an Ended
+        // parent drags every run down with it (no orphans working in the ruins).
+        let parent_ended = s.status == SessionStatus::Ended;
         for r in &mut s.subagents {
-            // Subagents use their own current.since as an approximation of the last event time.
-            let last = r.current.since.as_deref().or(r.started_at.as_deref());
+            // A recorded completion pins the run to Ended regardless of how
+            // recent its last transcript entry is (apply_sub lifts the pin when
+            // genuinely later activity arrives).
+            if parent_ended || r.completed_at.is_some() {
+                r.status = SessionStatus::Ended;
+                mark_idle(&mut r.current);
+                continue;
+            }
+            let last = r
+                .last_event_at
+                .as_deref()
+                .or(r.current.since.as_deref())
+                .or(r.started_at.as_deref());
             r.status = status_from_last(last, now);
             if r.status != SessionStatus::Active && !keeps_awaiting_state(r.status, r.current.kind) {
                 mark_idle(&mut r.current);
@@ -698,6 +853,194 @@ mod tests {
         assert_eq!(z.spawn_depth, Some(2));
         assert_eq!(z.tool_use_id.as_deref(), Some("t99"));
         assert_eq!(z.parent_agent_id, None, "caller unknown, so no parent is claimed");
+    }
+
+    /// The parent's tool_result for the spawning Agent call ends the run the moment
+    /// it is recorded — no waiting out the inactivity decay — and recompute keeps it
+    /// Ended even though its last transcript entry is seconds old.
+    #[test]
+    fn parent_tool_result_ends_run_immediately() {
+        let mut w = World::default();
+        let delegate = e(
+            r#"{"type":"assistant","timestamp":"2026-06-21T16:20:00.000Z","sessionId":"S","cwd":"/proj","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Agent","input":{"subagent_type":"Explore","description":"dig"}}]}}"#,
+        );
+        apply_main(&mut w, "S", &[delegate], &mut Vec::new());
+        let work = e(
+            r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-06-21T16:20:30.000Z","sessionId":"S","message":{"role":"assistant","content":[{"type":"tool_use","id":"t5","name":"Bash","input":{"command":"ls","description":"list"}}]}}"#,
+        );
+        apply_sub(&mut w, "S", "A", Some(&meta("t1", 1)), &[work], &mut Vec::new());
+        assert_eq!(w.sessions.get("S").unwrap().subagents[0].status, SessionStatus::Active);
+
+        let result = e(
+            r#"{"type":"user","timestamp":"2026-06-21T16:20:40.000Z","sessionId":"S","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"all done"}]}}"#,
+        );
+        apply_main(&mut w, "S", &[result], &mut Vec::new());
+        {
+            let r = &w.sessions.get("S").unwrap().subagents[0];
+            assert_eq!(r.status, SessionStatus::Ended, "ends when the result is recorded");
+            assert_eq!(r.current.kind, WorkKind::Idle);
+            assert_eq!(r.completed_at.as_deref(), Some("2026-06-21T16:20:40.000Z"));
+        }
+
+        // 30 seconds later the decay rule alone would say Active; the pin must win.
+        let now = DateTime::parse_from_rfc3339("2026-06-21T16:21:10.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        recompute_statuses(&mut w, now);
+        assert_eq!(
+            w.sessions.get("S").unwrap().subagents[0].status,
+            SessionStatus::Ended,
+            "a completed run must not come back via time-based recompute"
+        );
+    }
+
+    /// Transcript writes stamped before the parent's tool_result can be processed
+    /// after it (the watcher orders files arbitrarily); they must not revive the run.
+    #[test]
+    fn trailing_writes_do_not_revive_completed_run() {
+        let mut w = World::default();
+        let delegate = e(
+            r#"{"type":"assistant","timestamp":"2026-06-21T16:20:00.000Z","sessionId":"S","cwd":"/proj","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Agent","input":{"subagent_type":"Explore","description":"dig"}}]}}"#,
+        );
+        let result = e(
+            r#"{"type":"user","timestamp":"2026-06-21T16:20:40.000Z","sessionId":"S","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"done"}]}}"#,
+        );
+        apply_main(&mut w, "S", &[delegate, result], &mut Vec::new());
+
+        // The final transcript flush (stamped before the result) arrives afterwards.
+        let trailing = e(
+            r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-06-21T16:20:39.000Z","sessionId":"S","message":{"role":"assistant","content":[{"type":"text","text":"summary"}]}}"#,
+        );
+        apply_sub(&mut w, "S", "A", Some(&meta("t1", 1)), &[trailing], &mut Vec::new());
+        let r = &w.sessions.get("S").unwrap().subagents[0];
+        assert_eq!(r.status, SessionStatus::Ended, "older writes must not revive the run");
+        assert!(r.completed_at.is_some());
+    }
+
+    /// The tool_result returned right away for run_in_background is a launch ack,
+    /// not the agent's completion; the run keeps working.
+    #[test]
+    fn async_launch_ack_does_not_end_run() {
+        let mut w = World::default();
+        let delegate = e(
+            r#"{"type":"assistant","timestamp":"2026-06-21T16:20:00.000Z","sessionId":"S","cwd":"/proj","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Agent","input":{"subagent_type":"Explore","description":"dig"}}]}}"#,
+        );
+        let ack = e(
+            r#"{"type":"user","timestamp":"2026-06-21T16:20:02.000Z","sessionId":"S","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"Async agent launched successfully. (internal metadata)\nagentId: abc"}]}]}}"#,
+        );
+        apply_main(&mut w, "S", &[delegate, ack], &mut Vec::new());
+        let r = &w.sessions.get("S").unwrap().subagents[0];
+        assert_eq!(r.status, SessionStatus::Active, "the launch ack is not a completion");
+        assert!(r.completed_at.is_none());
+    }
+
+    /// A background agent's stop is recorded as a task-notification queue-operation;
+    /// that ends the run, and a resumed agent (later transcript entries) revives it.
+    #[test]
+    fn task_notification_ends_and_resume_revives() {
+        let mut w = World::default();
+        let delegate = e(
+            r#"{"type":"assistant","timestamp":"2026-06-21T16:20:00.000Z","sessionId":"S","cwd":"/proj","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Agent","input":{"subagent_type":"Explore","description":"dig"}}]}}"#,
+        );
+        apply_main(&mut w, "S", &[delegate], &mut Vec::new());
+        let work = e(
+            r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-06-21T16:20:30.000Z","sessionId":"S","message":{"role":"assistant","content":[{"type":"tool_use","id":"t5","name":"Bash","input":{"command":"ls","description":"list"}}]}}"#,
+        );
+        apply_sub(&mut w, "S", "aid1", Some(&meta("t1", 1)), &[work], &mut Vec::new());
+
+        let notify = e(
+            r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-06-21T16:21:00.000Z","sessionId":"S","content":"<task-notification>\n<task-id>aid1</task-id>\n<tool-use-id>t1</tool-use-id>\n<status>completed</status>\n<summary>done</summary>\n</task-notification>"}"#,
+        );
+        apply_main(&mut w, "S", &[notify], &mut Vec::new());
+        assert_eq!(
+            w.sessions.get("S").unwrap().subagents[0].status,
+            SessionStatus::Ended,
+            "the stop notification ends the background run"
+        );
+
+        // The user sends it another message: genuinely later transcript activity.
+        let resumed = e(
+            r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-06-21T16:25:00.000Z","sessionId":"S","message":{"role":"assistant","content":[{"type":"tool_use","id":"t9","name":"Read","input":{"file_path":"/a/b.ts"}}]}}"#,
+        );
+        apply_sub(&mut w, "S", "aid1", Some(&meta("t1", 1)), &[resumed], &mut Vec::new());
+        let r = &w.sessions.get("S").unwrap().subagents[0];
+        assert_eq!(r.status, SessionStatus::Active, "a resumed agent clocks back in");
+        assert!(r.completed_at.is_none(), "the completion pin is lifted");
+    }
+
+    /// A task-notification still ends the run when the task-id doesn't match any
+    /// agent_id (e.g. the transcript was never read, so the run only knows its
+    /// spawning tool_use id) — the tool-use-id side of the match is the safety net.
+    #[test]
+    fn task_notification_matches_by_tool_use_id() {
+        let mut w = World::default();
+        let delegate = e(
+            r#"{"type":"assistant","timestamp":"2026-06-21T16:20:00.000Z","sessionId":"S","cwd":"/proj","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Agent","input":{"subagent_type":"Explore","description":"dig"}}]}}"#,
+        );
+        apply_main(&mut w, "S", &[delegate], &mut Vec::new());
+        assert!(w.sessions.get("S").unwrap().subagents[0].agent_id.is_empty());
+
+        let notify = e(
+            r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-06-21T16:21:00.000Z","sessionId":"S","content":"<task-notification>\n<task-id>never-read</task-id>\n<tool-use-id>t1</tool-use-id>\n<status>completed</status>\n</task-notification>"}"#,
+        );
+        apply_main(&mut w, "S", &[notify], &mut Vec::new());
+        assert_eq!(
+            w.sessions.get("S").unwrap().subagents[0].status,
+            SessionStatus::Ended,
+            "matched via tool-use-id despite the unknown task-id"
+        );
+    }
+
+    /// A killed CLI records no tool_results: once the parent decays to Ended,
+    /// every run under it ends too instead of haunting the park.
+    #[test]
+    fn ended_parent_cascades_to_runs() {
+        let mut w = World::default();
+        let session = w
+            .sessions
+            .entry("S".to_string())
+            .or_insert_with(|| new_session("S"));
+        session.last_event_at = Some("2026-06-21T16:00:00.000Z".to_string());
+        session.subagents.push(SubAgentRun {
+            agent_id: "A".to_string(),
+            status: SessionStatus::Active,
+            last_event_at: Some("2026-06-21T16:59:00.000Z".to_string()),
+            ..Default::default()
+        });
+
+        let now = DateTime::parse_from_rfc3339("2026-06-21T17:00:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        recompute_statuses(&mut w, now);
+        let s = w.sessions.get("S").unwrap();
+        assert_eq!(s.status, SessionStatus::Ended);
+        assert_eq!(s.subagents[0].status, SessionStatus::Ended, "no orphan runs under an ended parent");
+    }
+
+    /// Status decay uses the run's own last_event_at: entries that don't change the
+    /// work kind (tool_results, text) still count as signs of life.
+    #[test]
+    fn sub_decay_uses_last_event_at() {
+        let mut w = World::default();
+        let work = e(
+            r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-06-21T16:20:00.000Z","sessionId":"S","message":{"role":"assistant","content":[{"type":"tool_use","id":"t5","name":"Bash","input":{"command":"sleep 300","description":"wait"}}]}}"#,
+        );
+        // Six minutes later only a tool_result lands (classify keeps the old state,
+        // so current.since stays at 16:20).
+        let result = e(
+            r#"{"type":"user","isSidechain":true,"timestamp":"2026-06-21T16:26:00.000Z","sessionId":"S","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t5","content":"ok"}]}}"#,
+        );
+        apply_sub(&mut w, "S", "A", None, &[work, result], &mut Vec::new());
+
+        let now = DateTime::parse_from_rfc3339("2026-06-21T16:27:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        recompute_statuses(&mut w, now);
+        assert_eq!(
+            w.sessions.get("S").unwrap().subagents[0].status,
+            SessionStatus::Active,
+            "the since-based approximation would say Idle; last_event_at keeps it Active"
+        );
     }
 
     /// Verifies running a real session JSONL through the full parse -> classify -> state-tracking pipeline.
@@ -1108,6 +1451,146 @@ mod tests {
         let kinds: Vec<&str> = out.iter().map(|h| h.event.as_str()).collect();
         assert_eq!(kinds, vec!["PreToolUse", "SubagentStop"]);
         assert!(out.iter().all(|h| h.agent_id.as_deref() == Some("aid1")));
+    }
+
+    /// A stop_hook_summary enriches the Stop event with the recorded execution:
+    /// outcome, wall time, and the commands. A plain turn_duration stays bare.
+    #[test]
+    fn stop_summary_enriches_stop_event() {
+        use crate::hook_events::HookOutcome;
+        let mut w = World::default();
+        let summary = e(
+            r#"{"type":"system","subtype":"stop_hook_summary","hookInfos":[{"command":"afplay Funk.aiff","durationMs":2868}],"hookErrors":[],"preventedContinuation":false,"stopReason":"","timestamp":"2026-07-04T14:31:24.506Z","sessionId":"S"}"#,
+        );
+        let bare = e(r#"{"type":"system","subtype":"turn_duration","timestamp":"2026-07-04T14:31:24.516Z","sessionId":"S"}"#);
+        let mut out = Vec::new();
+        apply_main(&mut w, "S", &[summary, bare], &mut out);
+
+        let stops: Vec<_> = out.iter().filter(|h| h.event == "Stop").collect();
+        assert_eq!(stops.len(), 2);
+        assert_eq!(stops[0].outcome, Some(HookOutcome::Completed));
+        assert_eq!(stops[0].duration_ms, Some(2868.0));
+        assert_eq!(stops[0].hook_command.as_deref(), Some("afplay Funk.aiff"));
+        assert_eq!(stops[0].is_error, None, "no hookErrors, no error flag");
+        assert_eq!(stops[1].outcome, None, "turn_duration records no execution");
+    }
+
+    /// preventedContinuation marks the Stop event blocked and carries the reason.
+    /// In a sub agent the same record becomes a blocked SubagentStop.
+    #[test]
+    fn blocked_stop_summary_and_sub_variant() {
+        use crate::hook_events::HookOutcome;
+        let json = r#"{"type":"system","subtype":"stop_hook_summary","hookInfos":[{"command":"./gate.sh","durationMs":900}],"hookErrors":[],"preventedContinuation":true,"stopReason":"keep going","timestamp":"2026-07-04T14:31:24.506Z","sessionId":"S"}"#;
+        let mut out = Vec::new();
+        apply_main(&mut World::default(), "S", &[e(json)], &mut out);
+        let stop = out.iter().find(|h| h.event == "Stop").unwrap();
+        assert_eq!(stop.outcome, Some(HookOutcome::Blocked));
+        assert_eq!(stop.block_reason.as_deref(), Some("keep going"));
+
+        let mut out = Vec::new();
+        apply_sub(&mut World::default(), "S", "aid1", None, &[e(json)], &mut out);
+        let stop = out.iter().find(|h| h.event == "SubagentStop").unwrap();
+        assert_eq!(stop.outcome, Some(HookOutcome::Blocked));
+        assert_eq!(stop.agent_id.as_deref(), Some("aid1"));
+    }
+
+    /// A blocked stop summary keeps the session working: the turn did not end,
+    /// so the work kind and active skill survive the entry.
+    #[test]
+    fn blocked_stop_summary_keeps_working_state() {
+        let mut w = World::default();
+        let skill = e(r#"{"type":"assistant","timestamp":"2026-07-04T14:31:00.000Z","sessionId":"S","cwd":"/p","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Skill","input":{"skill":"verify"}}]}}"#);
+        let edit = e(r#"{"type":"assistant","timestamp":"2026-07-04T14:31:10.000Z","sessionId":"S","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"/a/x.ts"}}]}}"#);
+        let blocked = e(
+            r#"{"type":"system","subtype":"stop_hook_summary","hookInfos":[{"command":"./gate.sh","durationMs":900}],"preventedContinuation":true,"stopReason":"keep going","timestamp":"2026-07-04T14:31:24.506Z","sessionId":"S"}"#,
+        );
+        apply_main(&mut w, "S", &[skill, edit, blocked], &mut Vec::new());
+        let s = w.sessions.get("S").unwrap();
+        assert_eq!(s.current.kind, WorkKind::Editing, "the turn is still running");
+        assert_eq!(s.current.active_skill.as_deref(), Some("verify"), "skill survives");
+    }
+
+    /// A PreToolUse rejection buried behind an ordinary result in a parallel
+    /// batch is still found (all tool_result blocks are scanned).
+    #[test]
+    fn pre_hook_rejection_found_in_parallel_batch() {
+        use crate::hook_events::HookOutcome;
+        let mut w = World::default();
+        let batch = e(
+            r#"{"type":"user","timestamp":"2026-07-08T10:29:02.706Z","sessionId":"S","cwd":"/p","message":{"role":"user","content":[{"type":"tool_result","content":"ok","is_error":false,"tool_use_id":"tu_1"},{"type":"tool_result","content":"PreToolUse:Read hook error: [deny.sh]: nope","is_error":true,"tool_use_id":"tu_2"}]}}"#,
+        );
+        let mut out = Vec::new();
+        apply_main(&mut w, "S", &[batch], &mut out);
+        let blocked = out
+            .iter()
+            .find(|h| h.event == "PreToolUse")
+            .expect("rejection found behind the ordinary result");
+        assert_eq!(blocked.outcome, Some(HookOutcome::Blocked));
+        assert_eq!(blocked.correlation_id.as_deref(), Some("tu_2"));
+    }
+
+    /// A PreToolUse hook rejection (erroring tool_result with the CLI's message
+    /// format) reconstructs as a blocked PreToolUse, not a PostToolUse — the tool
+    /// never ran.
+    #[test]
+    fn pre_hook_rejection_reconstructs_as_blocked_pre() {
+        use crate::hook_events::HookOutcome;
+        let mut w = World::default();
+        let tool = e(r#"{"type":"assistant","timestamp":"2026-07-08T10:29:00.000Z","sessionId":"S","cwd":"/p","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"/x.txt"}}]}}"#);
+        let rejected = e(
+            r#"{"type":"user","timestamp":"2026-07-08T10:29:02.706Z","sessionId":"S","message":{"role":"user","content":[{"type":"tool_result","content":"PreToolUse:Read hook error: [exit 2]: not allowed\n","is_error":true,"tool_use_id":"tu_1"}]}}"#,
+        );
+        let mut out = Vec::new();
+        apply_main(&mut w, "S", &[tool, rejected], &mut out);
+
+        let events: Vec<&str> = out.iter().map(|h| h.event.as_str()).collect();
+        assert!(!events.contains(&"PostToolUse"), "a rejected tool has no Post");
+        let blocked = out
+            .iter()
+            .find(|h| h.event == "PreToolUse" && h.outcome.is_some())
+            .expect("blocked Pre emitted");
+        assert_eq!(blocked.outcome, Some(HookOutcome::Blocked));
+        assert_eq!(blocked.tool_name.as_deref(), Some("Read"));
+        assert_eq!(blocked.correlation_id.as_deref(), Some("tu_1"));
+        assert_eq!(blocked.hook_command.as_deref(), Some("exit 2"));
+        assert_eq!(blocked.block_reason.as_deref(), Some("not allowed"));
+    }
+
+    /// A hook_blocking_error attachment reconstructs as a blocked PostToolUse
+    /// carrying the tool, pairing id, command, and reason.
+    #[test]
+    fn hook_blocking_attachment_reconstructs() {
+        use crate::hook_events::HookOutcome;
+        let mut w = World::default();
+        let entry = e(
+            r#"{"type":"attachment","attachment":{"type":"hook_blocking_error","hookName":"PostToolUse:Bash","toolUseID":"tu_9","hookEvent":"PostToolUse","blockingError":{"blockingError":"[lint.sh]: style violation","command":"lint.sh"}},"timestamp":"2026-07-08T10:34:11.086Z","sessionId":"S"}"#,
+        );
+        let mut out = Vec::new();
+        apply_main(&mut w, "S", &[entry], &mut out);
+        let b = out.iter().find(|h| h.event == "PostToolUse").expect("emitted");
+        assert_eq!(b.outcome, Some(HookOutcome::Blocked));
+        assert_eq!(b.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(b.correlation_id.as_deref(), Some("tu_9"));
+        assert_eq!(b.hook_command.as_deref(), Some("lint.sh"));
+    }
+
+    /// A hook_cancelled attachment reconstructs as a cancelled event with the
+    /// elapsed time; in a sub agent a cancelled Stop becomes SubagentStop.
+    #[test]
+    fn hook_cancelled_attachment_reconstructs() {
+        use crate::hook_events::HookOutcome;
+        let json = r#"{"type":"attachment","attachment":{"type":"hook_cancelled","hookName":"Stop","hookEvent":"Stop","command":"afplay Funk.aiff","durationMs":2179},"timestamp":"2026-07-04T21:06:14.258Z","sessionId":"S"}"#;
+        let mut out = Vec::new();
+        apply_main(&mut World::default(), "S", &[e(json)], &mut out);
+        let c = out.iter().find(|h| h.event == "Stop").expect("emitted");
+        assert_eq!(c.outcome, Some(HookOutcome::Cancelled));
+        assert_eq!(c.duration_ms, Some(2179.0));
+        assert_eq!(c.hook_command.as_deref(), Some("afplay Funk.aiff"));
+
+        let mut out = Vec::new();
+        apply_sub(&mut World::default(), "S", "aid1", None, &[e(json)], &mut out);
+        assert_eq!(out[0].event, "SubagentStop");
+        assert_eq!(out[0].outcome, Some(HookOutcome::Cancelled));
     }
 
     #[test]
